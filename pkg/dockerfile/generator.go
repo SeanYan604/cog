@@ -4,6 +4,8 @@ import (
 	// blank import for embeds
 	_ "embed"
 	"fmt"
+	"io/fs"
+	"io/ioutil"
 	"os"
 	"path"
 	"path/filepath"
@@ -15,6 +17,13 @@ import (
 
 //go:embed embed/cog.whl
 var cogWheelEmbed []byte
+
+const (
+	// this will also be the number of extra docker image layers
+	// besides the cog base layers.
+	maxNumFileGroups  = 1
+	fileSizeThresHold = 200 * 1000 * 1000 // 100 MegaBytes
+)
 
 type Generator struct {
 	Config *config.Config
@@ -28,9 +37,12 @@ type Generator struct {
 	tmpDir string
 	// tmpDir relative to Dir
 	relativeTmpDir string
+	// groupFile indicates grouping small files into independent docker
+	// image layer
+	groupFile bool
 }
 
-func NewGenerator(config *config.Config, dir string) (*Generator, error) {
+func NewGenerator(config *config.Config, dir string, groupFile bool) (*Generator, error) {
 	rootTmp := path.Join(dir, ".cog/tmp")
 	if err := os.MkdirAll(rootTmp, 0o755); err != nil {
 		return nil, err
@@ -53,6 +65,7 @@ func NewGenerator(config *config.Config, dir string) (*Generator, error) {
 		GOARCH:         runtime.GOOS,
 		tmpDir:         tmpDir,
 		relativeTmpDir: relativeTmpDir,
+		groupFile:      groupFile,
 	}, nil
 }
 
@@ -101,15 +114,164 @@ func (g *Generator) GenerateBase() (string, error) {
 	}), "\n"), nil
 }
 
+// dirSize returns the size of the given `dir`
+func dirSize(dir string) (int64, error) {
+	var size int64
+	if err := filepath.Walk(dir,
+		func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if !info.IsDir() {
+				size += info.Size()
+			}
+			return nil
+		},
+	); err != nil {
+		return 0, err
+	}
+	return size, nil
+}
+
+// divFilesBySize divides files in workspace into small files
+// (size < `threshold`) and large files (size > `threshold`).
+func divFilesBySize(threshold int64, files []fs.FileInfo) (
+	smalls []string,
+	larges []string,
+	small_folders []string,
+	large_folders []string,
+	err error,
+) {
+	for _, file := range files {
+		size := file.Size()
+		if file.IsDir() {
+			size, err = dirSize(file.Name())
+			if err != nil {
+				return nil, nil, nil, nil, err
+			}
+			if size <= threshold {
+				small_folders = append(small_folders, file.Name())
+				continue
+			}
+			large_folders = append(large_folders, file.Name())
+			continue
+		}
+		if size <= threshold {
+			// check if file size is smaller than 100 MB
+			smalls = append(smalls, file.Name())
+			continue
+		}
+		larges = append(larges, file.Name())
+	}
+	return
+}
+
+// groupFile divide files in the workspace into `numGroups` of groups.
+func groupFiles(numGroups int, fileSizeThresHold int64, files []fs.FileInfo) ([][]string, [][]string, error) {
+	smalls, larges, small_folders, large_folders, err := divFilesBySize(fileSizeThresHold, files)
+	if err != nil {
+		return nil, nil, err
+	}
+	ret := [][]string{}
+	ret_folder := [][]string{}
+
+	// put all large files in an independent group.
+	if len(larges) > 0 {
+		ret = append(ret, larges)
+	}
+	// put all large folders in an independent group.
+	if len(large_folders) > 0 {
+		ret_folder = append(ret, large_folders)
+	}
+	// put all small folders in an independent group.
+	if len(small_folders) > 0 {
+		ret_folder = append(ret, small_folders)
+	}
+	// put all small files in an independent group.
+	numSmalls := len(smalls)
+	if numSmalls <= numGroups {
+		// put each file in one group
+		for _, f := range smalls {
+			ret = append(ret, []string{f})
+		}
+		return ret, ret_folder, nil
+	}
+	// TODO(charleszheng44): The algorithm dividing small files into groups
+	// and assigns each group to a docker image layer can be enhanced.
+	// Two potential issues that may arise:
+	// 1. Large groups of small files can still slow down the deployment
+	//    process, despite being evenly divided.
+	// 2. Users making changes to files in different groups can trigger the
+	//    regeneration of all related layers, leading to a sluggish deployment.
+	filePerGroup, i := numSmalls/numGroups, 0
+	for q := 0; q < numGroups; q++ {
+		curGrp := []string{}
+		for j := 0; j < filePerGroup; j, i = j+1, i+1 {
+			curGrp = append(curGrp, smalls[i])
+		}
+		ret = append(ret, curGrp)
+	}
+	// put the reminders into the last group.
+	if i < numSmalls {
+		ret[numGroups-1] = append(ret[numGroups-1], smalls[i:]...)
+	}
+
+	return ret, ret_folder, nil
+}
+
+// copyWorkspace generates the Dockerfile COPY command copying files in the
+// current directory to the /src directory in the docker container.
+func (g *Generator) copyWorkspace() (string, error) {
+	if !g.groupFile {
+		return "COPY . /src", nil
+	}
+
+	ret := ""
+	files, err := ioutil.ReadDir(".")
+	if err != nil {
+		return "", err
+	}
+	groups, folder_groups, err := groupFiles(maxNumFileGroups, fileSizeThresHold, files)
+	if err != nil {
+		return "", err
+	}
+
+	for _, group := range groups {
+		copyCmd := "COPY "
+		for _, file := range group {
+			copyCmd = copyCmd + file + " "
+		}
+		copyCmd = copyCmd + "/src" + "\n"
+		ret = ret + copyCmd
+	}
+
+	for _, group := range folder_groups {
+		sig_cmd := ""
+		for _, file := range group {
+			sig_cmd = "COPY " + file + " /src/" + file + "\n"
+			ret = ret + sig_cmd
+		}
+	}
+
+	return ret, nil
+}
+
 func (g *Generator) Generate() (string, error) {
 	base, err := g.GenerateBase()
 	if err != nil {
 		return "", err
 	}
-	return strings.Join(filterEmpty([]string{
-		base,
-		`COPY . /src`,
-	}), "\n"), nil
+
+	copyWorkspace, err := g.copyWorkspace()
+	if err != nil {
+		return "", err
+	}
+
+	return strings.Join(filterEmpty(
+		[]string{
+			base,
+			copyWorkspace,
+		}), "\n"), nil
 }
 
 func (g *Generator) Cleanup() error {
@@ -202,7 +364,7 @@ func (g *Generator) installCog() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	lines = append(lines, fmt.Sprintf("RUN --mount=type=cache,target=/root/.cache/pip pip install %s", containerPath))
+	lines = append(lines, fmt.Sprintf("RUN --mount=type=cache,target=/root/.cache/pip pip install -i https://pypi.tuna.tsinghua.edu.cn/simple %s", containerPath))
 	return strings.Join(lines, "\n"), nil
 }
 
@@ -220,7 +382,7 @@ func (g *Generator) pipInstalls() (string, error) {
 		return "", err
 	}
 
-	lines = append(lines, "RUN --mount=type=cache,target=/root/.cache/pip pip install -r "+containerPath)
+	lines = append(lines, "RUN --mount=type=cache,target=/root/.cache/pip pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r "+containerPath)
 	return strings.Join(lines, "\n"), nil
 }
 

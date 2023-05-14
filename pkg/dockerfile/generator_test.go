@@ -2,9 +2,12 @@ package dockerfile
 
 import (
 	"fmt"
+	"io/fs"
 	"os"
 	"path"
+	"strconv"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -26,7 +29,7 @@ ENTRYPOINT ["/sbin/tini", "--"]
 
 func testInstallCog(relativeTmpDir string) string {
 	return fmt.Sprintf(`COPY %s/cog-0.0.1.dev-py3-none-any.whl /tmp/cog-0.0.1.dev-py3-none-any.whl
-RUN --mount=type=cache,target=/root/.cache/pip pip install /tmp/cog-0.0.1.dev-py3-none-any.whl`, relativeTmpDir)
+RUN --mount=type=cache,target=/root/.cache/pip pip install -i https://pypi.tuna.tsinghua.edu.cn/simple /tmp/cog-0.0.1.dev-py3-none-any.whl`, relativeTmpDir)
 }
 
 func testInstallPython(version string) string {
@@ -59,6 +62,153 @@ RUN curl -s -S -L https://raw.githubusercontent.com/pyenv/pyenv-installer/master
 `, version, version)
 }
 
+type mockFileInfo struct {
+	files []*mockFileInfo
+	mode  fs.FileMode
+	name  string
+	size  int64
+}
+
+var _ fs.FileInfo = (*mockFileInfo)(nil)
+
+func (mfi *mockFileInfo) IsDir() bool {
+	return len(mfi.files) != 0
+}
+
+func (mfi *mockFileInfo) ModTime() time.Time {
+	return time.Now()
+}
+
+func (mfi *mockFileInfo) Mode() fs.FileMode {
+	return mfi.mode
+}
+
+func (mfi *mockFileInfo) Name() string {
+	return mfi.name
+}
+
+func (mfi *mockFileInfo) Size() int64 {
+	return mfi.size
+}
+
+func (mfi *mockFileInfo) Sys() any {
+	return mfi.files
+}
+
+func TestGroupFiles(t *testing.T) {
+	testCases := []struct {
+		inputs    []fs.FileInfo
+		expect    [][]string
+		numGroups int
+		threshold int64
+	}{
+		{
+			[]fs.FileInfo{
+				&mockFileInfo{
+					files: nil,
+					name:  "smallFile1",
+					size:  1000,
+					mode:  fs.ModeTemporary,
+				},
+				&mockFileInfo{
+					files: nil,
+					name:  "smallFile2",
+					size:  1000,
+					mode:  fs.ModeTemporary,
+				},
+				&mockFileInfo{
+					files: nil,
+					name:  "smallFile3",
+					size:  1000,
+					mode:  fs.ModeTemporary,
+				},
+			},
+			[][]string{
+				{"smallFile1"},
+				{"smallFile2", "smallFile3"},
+			},
+			2,
+			1001,
+		},
+		{
+			[]fs.FileInfo{
+				&mockFileInfo{
+					files: nil,
+					name:  "smallFile1",
+					size:  1000,
+					mode:  fs.ModeTemporary,
+				},
+				&mockFileInfo{
+					files: nil,
+					name:  "smallFile2",
+					size:  1000,
+					mode:  fs.ModeTemporary,
+				},
+				&mockFileInfo{
+					files: nil,
+					name:  "largeFile3",
+					size:  1002,
+					mode:  fs.ModeTemporary,
+				},
+			},
+			[][]string{
+				{"largeFile3"},
+				{"smallFile1", "smallFile2"},
+			},
+			1,
+			1001,
+		},
+		{
+			[]fs.FileInfo{
+				&mockFileInfo{
+					files: nil,
+					name:  "smallFile1",
+					size:  1000,
+					mode:  fs.ModeTemporary,
+				},
+				&mockFileInfo{
+					files: nil,
+					name:  "smallFile2",
+					size:  1000,
+					mode:  fs.ModeTemporary,
+				},
+				&mockFileInfo{
+					name:  "largeFile1",
+					size:  1002,
+					mode:  fs.ModeTemporary,
+					files: nil,
+				},
+				&mockFileInfo{
+					name:  "largeFile2",
+					size:  1003,
+					mode:  fs.ModeTemporary,
+					files: nil,
+				},
+			},
+			[][]string{
+				{"largeFile1", "largeFile2"},
+				{"smallFile1"},
+				{"smallFile2"},
+			},
+			2,
+			1000,
+		},
+	}
+
+	for i, tc := range testCases {
+		tc := tc
+		t.Run(
+			strconv.Itoa(i),
+			func(t *testing.T) {
+				t.Parallel()
+				actual, _, err := groupFiles(tc.numGroups, tc.threshold, tc.inputs)
+				require.NoError(t, err)
+				require.Equal(t, tc.expect, actual)
+			},
+		)
+	}
+}
+
 func TestGenerateEmptyCPU(t *testing.T) {
 	tmpDir := t.TempDir()
 
@@ -70,7 +220,7 @@ predict: predict.py:Predictor
 	require.NoError(t, err)
 	require.NoError(t, conf.ValidateAndComplete(""))
 
-	gen, err := NewGenerator(conf, tmpDir)
+	gen, err := NewGenerator(conf, tmpDir, true)
 	require.NoError(t, err)
 	actual, err := gen.Generate()
 	require.NoError(t, err)
@@ -99,7 +249,7 @@ predict: predict.py:Predictor
 `))
 	require.NoError(t, err)
 	require.NoError(t, conf.ValidateAndComplete(""))
-	gen, err := NewGenerator(conf, tmpDir)
+	gen, err := NewGenerator(conf, tmpDir, true)
 	require.NoError(t, err)
 	actual, err := gen.Generate()
 	require.NoError(t, err)
@@ -137,7 +287,7 @@ predict: predict.py:Predictor
 	require.NoError(t, err)
 	require.NoError(t, conf.ValidateAndComplete(""))
 
-	gen, err := NewGenerator(conf, tmpDir)
+	gen, err := NewGenerator(conf, tmpDir, true)
 	require.NoError(t, err)
 	actual, err := gen.Generate()
 	require.NoError(t, err)
@@ -150,7 +300,7 @@ ENV LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/lib/x86_64-linux-gnu:/usr/local/nvidia
 ` + testTini() + testInstallCog(gen.relativeTmpDir) + `
 RUN --mount=type=cache,target=/var/cache/apt apt-get update -qq && apt-get install -qqy ffmpeg cowsay && rm -rf /var/lib/apt/lists/*
 COPY ` + gen.relativeTmpDir + `/requirements.txt /tmp/requirements.txt
-RUN --mount=type=cache,target=/root/.cache/pip pip install -r /tmp/requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r /tmp/requirements.txt
 RUN cowsay moo
 WORKDIR /src
 EXPOSE 5000
@@ -185,7 +335,7 @@ predict: predict.py:Predictor
 	require.NoError(t, err)
 	require.NoError(t, conf.ValidateAndComplete(""))
 
-	gen, err := NewGenerator(conf, tmpDir)
+	gen, err := NewGenerator(conf, tmpDir, true)
 	require.NoError(t, err)
 	actual, err := gen.Generate()
 	require.NoError(t, err)
@@ -200,7 +350,7 @@ ENV LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/lib/x86_64-linux-gnu:/usr/local/nvidia
 		testInstallCog(gen.relativeTmpDir) + `
 RUN --mount=type=cache,target=/var/cache/apt apt-get update -qq && apt-get install -qqy ffmpeg cowsay && rm -rf /var/lib/apt/lists/*
 COPY ` + gen.relativeTmpDir + `/requirements.txt /tmp/requirements.txt
-RUN --mount=type=cache,target=/root/.cache/pip pip install -r /tmp/requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r /tmp/requirements.txt
 RUN cowsay moo
 WORKDIR /src
 EXPOSE 5000
@@ -229,7 +379,7 @@ build:
 	require.NoError(t, err)
 	require.NoError(t, conf.ValidateAndComplete(""))
 
-	gen, err := NewGenerator(conf, tmpDir)
+	gen, err := NewGenerator(conf, tmpDir, true)
 	require.NoError(t, err)
 	actual, err := gen.Generate()
 	require.NoError(t, err)
@@ -261,10 +411,10 @@ build:
 	require.NoError(t, err)
 	require.NoError(t, conf.ValidateAndComplete(tmpDir))
 
-	gen, err := NewGenerator(conf, tmpDir)
+	gen, err := NewGenerator(conf, tmpDir, true)
 	require.NoError(t, err)
 	actual, err := gen.Generate()
 	require.NoError(t, err)
 	fmt.Println(actual)
-	require.Contains(t, actual, `pip install -r /tmp/requirements.txt`)
+	require.Contains(t, actual, `pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r /tmp/requirements.txt`)
 }
