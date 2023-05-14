@@ -152,10 +152,12 @@ func divFilesBySize(threshold int64, files []fs.FileInfo) (
 			if size <= threshold {
 				small_folders = append(small_folders, file.Name())
 				continue
+			} else {
+				large_folders = append(large_folders, file.Name())
+				continue
 			}
-			large_folders = append(large_folders, file.Name())
-			continue
 		}
+
 		if size <= threshold {
 			// check if file size is smaller than 100 MB
 			smalls = append(smalls, file.Name())
